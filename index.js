@@ -10,6 +10,10 @@ app.post('/api/jarvis', async (req, res) => {
     try {
         const userPrompt = req.body.prompt || "Hello";
         
+        if (!GEMINI_API_KEY) {
+            return res.status(500).json({ reply: "Error: GEMINI_API_KEY missing on Render!" });
+        }
+
         const response = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             {
@@ -25,8 +29,9 @@ app.post('/api/jarvis', async (req, res) => {
         const aiText = response.data.candidates[0].content.parts[0].text;
         res.json({ reply: aiText });
     } catch (error) {
-        console.error("API Error:", error.message);
-        res.status(500).json({ reply: "Server Error" });
+        const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
+        console.error("API Error Details:", errorDetails);
+        res.status(500).json({ reply: "Gemini Error: " + errorDetails });
     }
 });
 
