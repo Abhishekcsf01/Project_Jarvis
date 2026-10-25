@@ -78,6 +78,8 @@ def process_utterance(device_id, pcm_bytes, job_id):
             raise RuntimeError("GEMINI_API_KEY is not configured on the server.")
 
         wav_data = pcm_to_wav_bytes(pcm_bytes)
+        app.logger.info("gemini_transcription_start device=%s wav_bytes=%d model=%s",
+                        device_id, len(wav_data), AUDIO_MODEL)
         audio_part = types.Part.from_bytes(data=wav_data, mime_type="audio/wav")
         transcription = client.models.generate_content(
             model=AUDIO_MODEL,
@@ -89,8 +91,11 @@ def process_utterance(device_id, pcm_bytes, job_id):
             config=types.GenerateContentConfig(temperature=0, max_output_tokens=300),
         )
         transcript = (getattr(transcription, "text", "") or "").strip()
+        app.logger.info("gemini_transcription_done device=%s transcript_chars=%d",
+                        device_id, len(transcript))
 
         if not transcript or len(transcript) < 2:
+            app.logger.warning("empty_transcript device=%s; returning to listening", device_id)
             with states_lock:
                 current = states.get(device_id)
                 if current and current["job_id"] == job_id:
@@ -98,6 +103,7 @@ def process_utterance(device_id, pcm_bytes, job_id):
                     current["updated_at"] = time.time()
             return
 
+        app.logger.info("gemini_chat_start device=%s model=%s", device_id, CHAT_MODEL)
         completion = client.models.generate_content(
             model=CHAT_MODEL,
             contents=(
@@ -109,6 +115,7 @@ def process_utterance(device_id, pcm_bytes, job_id):
             config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=160),
         )
         reply = (getattr(completion, "text", "") or "").strip()
+        app.logger.info("gemini_chat_done device=%s reply_chars=%d", device_id, len(reply))
 
         with states_lock:
             current = states.get(device_id)
@@ -119,8 +126,9 @@ def process_utterance(device_id, pcm_bytes, job_id):
                 current["updated_at"] = time.time()
 
     except Exception as exc:
-        # Keep detailed errors in Render logs, but return a generic status to the device.
-        app.logger.exception("Cloud processing failed for device %s", device_id)
+        # Detailed exception is logged server-side; never send secrets to the device.
+        app.logger.exception("Cloud processing failed for device %s: %s",
+                             device_id, type(exc).__name__)
         with states_lock:
             current = states.get(device_id)
             if current and current["job_id"] == job_id:
@@ -144,6 +152,9 @@ def health():
         "ok": True,
         "gemini_key_configured": bool(GEMINI_API_KEY),
         "device_token_configured": bool(DEVICE_TOKEN),
+        "audio_model": AUDIO_MODEL,
+        "chat_model": CHAT_MODEL,
+        "rms_threshold": RMS_THRESHOLD,
     })
 
 
@@ -170,6 +181,10 @@ def audio():
     with states_lock:
         state["updated_at"] = time.time()
         state["pre_roll"].append(raw)
+        app.logger.info(
+            "audio_chunk device=%s rms=%.1f threshold=%d speaking=%s status=%s",
+            device_id, rms, RMS_THRESHOLD, state["speaking"], state["status"]
+        )
 
         if rms >= RMS_THRESHOLD:
             if not state["speaking"]:
@@ -203,6 +218,15 @@ def audio():
                 job_id = state["job_id"]
                 state["status"] = "thinking"
                 utterance_to_process = candidate
+                app.logger.info(
+                    "utterance_complete device=%s chunks=%d bytes=%d job_id=%d",
+                    device_id, elapsed_chunks, len(candidate), job_id
+                )
+            else:
+                app.logger.info(
+                    "utterance_discarded device=%s chunks=%d min_chunks=%d",
+                    device_id, elapsed_chunks, min_chunks
+                )
 
     if utterance_to_process is not None:
         thread = threading.Thread(
