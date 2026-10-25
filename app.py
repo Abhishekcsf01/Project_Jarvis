@@ -7,16 +7,17 @@ from collections import deque
 
 import numpy as np
 from flask import Flask, jsonify, request
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "").strip()
-TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
+AUDIO_MODEL = os.environ.get("AUDIO_MODEL", "gemini-2.5-flash")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-2.5-flash")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # This in-memory state is intended for a single-device prototype.
 # Render restarts/instance changes clear this state; do not treat it as durable storage.
@@ -74,16 +75,18 @@ def process_utterance(device_id, pcm_bytes, job_id):
     state = get_state(device_id)
     try:
         if client is None:
-            raise RuntimeError("OPENAI_API_KEY is not configured on the server.")
+            raise RuntimeError("GEMINI_API_KEY is not configured on the server.")
 
         wav_data = pcm_to_wav_bytes(pcm_bytes)
-        audio_file = io.BytesIO(wav_data)
-        audio_file.name = "speech.wav"
-
-        transcription = client.audio.transcriptions.create(
-            model=TRANSCRIBE_MODEL,
-            file=audio_file,
-            # Let the transcription model detect Hindi, English, or Hinglish automatically.
+        audio_part = types.Part.from_bytes(data=wav_data, mime_type="audio/wav")
+        transcription = client.models.generate_content(
+            model=AUDIO_MODEL,
+            contents=[
+                "Transcribe only the spoken words in this audio. The speaker may use Hindi, "
+                "English, or Hinglish. Return only the transcript, without commentary.",
+                audio_part,
+            ],
+            config=types.GenerateContentConfig(temperature=0, max_output_tokens=300),
         )
         transcript = (getattr(transcription, "text", "") or "").strip()
 
@@ -95,23 +98,17 @@ def process_utterance(device_id, pcm_bytes, job_id):
                     current["updated_at"] = time.time()
             return
 
-        completion = client.chat.completions.create(
+        completion = client.models.generate_content(
             model=CHAT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are JARVIS, a helpful concise voice assistant. "
-                        "Reply in the same language as the user. The user may speak Hindi, "
-                        "English, or Hinglish. Keep replies short enough for a small OLED "
-                        "(ideally 1-3 short sentences). No markdown tables."
-                    ),
-                },
-                {"role": "user", "content": transcript},
-            ],
-            max_tokens=120,
+            contents=(
+                "You are JARVIS, a helpful concise voice assistant. Reply in the same language "
+                "as the user. The user may speak Hindi, English, or Hinglish. Keep replies "
+                "short enough for a small OLED (1-3 short sentences). No markdown tables.\n\n"
+                "User said: " + transcript
+            ),
+            config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=160),
         )
-        reply = (completion.choices[0].message.content or "").strip()
+        reply = (getattr(completion, "text", "") or "").strip()
 
         with states_lock:
             current = states.get(device_id)
@@ -145,7 +142,7 @@ def index():
 def health():
     return jsonify({
         "ok": True,
-        "openai_key_configured": bool(OPENAI_API_KEY),
+        "gemini_key_configured": bool(GEMINI_API_KEY),
         "device_token_configured": bool(DEVICE_TOKEN),
     })
 
@@ -155,7 +152,7 @@ def audio():
     if not authorized():
         return jsonify({"error": "unauthorized"}), 401
     if client is None:
-        return jsonify({"error": "server API key is not configured"}), 503
+        return jsonify({"error": "GEMINI_API_KEY is not configured on the server"}), 503
 
     device_id = request.headers.get("X-Device-Id", "jarvis-1")[:64]
     raw = request.get_data(cache=False)
